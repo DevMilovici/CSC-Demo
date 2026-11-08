@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CSC Signer · remote signing demo</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;600&family=Space+Grotesk:wght@500;600&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%277%27 fill=%27%2315171E%27/%3E%3Cpath d=%27M8 21c3-1 5-9 8-9s1 7 3 7 2-3 5-4%27 stroke=%27%23F08A5D%27 stroke-width=%272.5%27 fill=%27none%27 stroke-linecap=%27round%27/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="logo">✍</span> CSC Signer <span class="sub">a signature application for the CSC API v2.2</span></div>
+  <div class="conn" id="conn"><span class="dot"></span><span id="connText">Not connected</span></div>
+</header>
+
+<main class="layout">
+  <section class="wizard">
+    <div class="notice" id="notice" role="status" hidden></div>
+
+    <article class="step" id="s1" data-state="active">
+      <header><span class="num">1</span><div><h2>Connect to a signing provider</h2><p class="hint">Calls <code>info</code>, <code>auth/login</code>, <code>credentials/list</code> and <code>credentials/info</code></p></div></header>
+      <div class="body">
+        <form id="connectForm" class="grid">
+          <label class="wide">CSC server<input id="server" value="http://127.0.0.1:8080" autocomplete="url" required></label>
+          <label>Username<input id="username" value="alice" autocomplete="username" required></label>
+          <label>Password<input id="password" type="password" value="alice-password" autocomplete="current-password" required></label>
+          <div class="actions wide"><button class="primary" type="submit">Connect</button><span class="error" id="e1"></span></div>
+          <p class="hint wide">No account at this provider? <a id="signupLink" href="http://127.0.0.1:8080/account/signup" target="_blank" rel="noopener">Create one</a>, confirm your email, then connect here.</p>
+        </form>
+        <div class="summary" id="sum1"></div>
+      </div>
+    </article>
+
+    <article class="step" id="s2" data-state="locked">
+      <header><span class="num">2</span><div><h2>Choose a signing credential</h2><p class="hint">A credential is a key in the provider's HSM plus its certificate</p></div></header>
+      <div class="body">
+        <div class="creds" id="creds"></div>
+        <div class="newcred" id="newcred">
+          <div><strong>Request a new credential</strong>
+            <p class="hint">Runs <code>oauth2/authorize</code> → <code>oauth2/token</code> → <code>credentials/create</code>.
+            You sign in and choose the signing PIN on the provider's page; this app never sees it.</p></div>
+          <div class="choices" role="radiogroup" aria-label="Kind of credential">
+            <label class="choice">
+              <input type="radio" name="policy" value="qes" checked>
+              <span class="choice-body">
+                <span class="choice-title">Qualified signature <span class="badge scal2">SCAL 2</span></span>
+                <span class="choice-text">Each signature needs your PIN and a code sent by email</span>
+                <span class="choice-meta">QCP-n-qscd · 0.4.0.194112.1.2</span>
+              </span>
+            </label>
+            <label class="choice">
+              <input type="radio" name="policy" value="adv">
+              <span class="choice-body">
+                <span class="choice-title">Advanced signature <span class="badge">SCAL 1</span></span>
+                <span class="choice-text">Each signature needs only your PIN</span>
+                <span class="choice-meta">NCP · 0.4.0.2042.1.1</span>
+              </span>
+            </label>
+          </div>
+          <div class="actions"><button type="button" class="primary" id="requestCred">Continue at the provider →</button><span class="error" id="e2"></span></div>
+        </div>
+        <div class="summary" id="sum2"></div>
+      </div>
+    </article>
+
+    <article class="step" id="s3" data-state="locked">
+      <header><span class="num">3</span><div><h2>Add the PDF to sign</h2><p class="hint">Hashed here; only a 32-byte SHA-256 hash goes to the provider</p></div></header>
+      <div class="body">
+        <label class="drop" id="drop"><input type="file" id="file" accept="application/pdf">
+          <strong>Drop a PDF here</strong> or click to choose one</label>
+        <div class="actions"><button type="button" class="link" id="sample">Use the sample contract</button><span class="error" id="e3"></span></div>
+        <div class="summary" id="sum3"></div>
+      </div>
+    </article>
+
+    <article class="step" id="s4" data-state="locked">
+      <header><span class="num">4</span><div><h2>Approve the signature</h2><p class="hint">Calls <code>credentials/getChallenge</code>, <code>credentials/authorize</code> and <code>signatures/signHash</code></p></div></header>
+      <div class="body">
+        <div id="codeBox" class="codebox">
+          <div><strong>Email code</strong><p class="hint" id="codeHint">We'll email you a 6-digit code.</p></div>
+          <button type="button" id="sendCode">Email me a code</button>
+        </div>
+        <form id="signForm" class="grid">
+          <label>Signature PIN<input id="pin" type="password" inputmode="numeric" autocomplete="off" required></label>
+          <label id="codeField">Code from the email<input id="code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" placeholder="••••••"></label>
+          <div class="actions wide"><button class="primary" type="submit" id="signBtn">Sign the document</button><span class="error" id="e4"></span></div>
+        </form>
+      </div>
+    </article>
+
+    <article class="step done" id="s5" data-state="locked">
+      <header><span class="num">✓</span><div><h2>Signed</h2><p class="hint">PAdES signature embedded and validated</p></div></header>
+      <div class="body">
+        <div class="result" id="result"></div>
+        <div class="actions"><a class="button primary" id="download" href="/api/download">Download signed PDF</a><button type="button" id="again">Sign another document</button></div>
+      </div>
+    </article>
+  </section>
+
+  <aside class="wire">
+    <div class="wirehead"><h2>CSC wire log</h2><button type="button" class="link" id="clearLog">Clear</button></div>
+    <p class="hint">Every request this app sends to the provider. Click one to see the JSON. Secrets are hidden.</p>
+    <ol id="log" class="log"><li class="empty">No calls yet. Connect to start.</li></ol>
+  </aside>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>

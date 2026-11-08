@@ -8,6 +8,9 @@ Remote-signing demo for the Cloud Signature Consortium API:
                       hashes + builds the PAdES        PIN + email code → SAD → HSM signs
 ```
 
+Users can also **sign up** at the provider (with email confirmation) and **request their own signing
+credential** through the spec's OAuth 2.0 `credential-creation` flow and `credentials/create`.
+
 > Demo only: software keys instead of an HSM, a self-signed CA, and in-memory state. Don't use it for real signatures.
 
 ## 1. Install
@@ -52,6 +55,53 @@ Open **http://127.0.0.1:8000** and follow the four steps:
 The app embeds the signature as PAdES, validates it against the demo root CA and offers the signed PDF for download.
 The dark panel on the right shows every CSC request and response; click an entry to see the JSON. PINs, codes, tokens and SADs are hidden.
 
+### Your own account and credential
+
+1. In step 1, follow **Create one** (it opens `http://127.0.0.1:8080/account/signup`). Enter your name, email and a password.
+2. Open the confirmation link from the email (in console mode it's printed by the server).
+3. Connect with your email and password. A new account has no credentials yet.
+4. In step 2, pick **Qualified** or **Advanced** and press **Continue at the provider →**. On the provider's page, sign in,
+   choose a 4–8 digit signing PIN and press **Approve**.
+5. You land back in the web app with the new credential in the list. Sign with it as usual.
+
+## How enrollment and credential creation fit the CSC spec
+
+The spec covers only part of this:
+
+| Step | In the spec? | This demo |
+|---|---|---|
+| Creating a user account, identity proofing | **No.** Out of scope (§1 "key creation and enrollment"; §8.2.1 "exchange and register an Account ID") | `GET/POST /account/signup` + `GET /account/verify`: email confirmation stands in for identity proofing |
+| Authorizing the creation of a credential | **Yes**, §8.1.2: OAuth 2.0 only, scope `credential-creation` or RAR `authorization_details` | `oauth2/authorize` (PKCE required) → login + consent page → `oauth2/token` |
+| Creating the key and certificate | **Yes**, §11.4 `credentials/create` | New RSA key + certificate from the demo CA, with the requested policy |
+
+The flow, as seen by the web app (the "signature application"):
+
+```
+browser → GET  /oauth2/authorize?response_type=code&client_id=csc-signer&redirect_uri=…/oauth/callback
+              &code_challenge=…&code_challenge_method=S256&state=…
+              &authorization_details=[{"type":"https://cloudsignatureconsortium.org/2025/credential-creation",
+                                       "credentialCreationRequest":{"certificatePolicy":"0.4.0.194112.1.2"}}]
+        ← provider's page: user signs in, chooses the signing PIN, approves
+        ← 302 …/oauth/callback?code=…&state=…
+web app → POST /oauth2/token   grant_type=authorization_code, code, code_verifier, redirect_uri  (client secret via Basic)
+        ← {"access_token": …, "expires_in": 300, "authorization_details": [… subjectData from the account …]}
+web app → POST /csc/v2/credentials/create   Authorization: Bearer <that token>
+          {"credentialCreationRequest": {"certificatePolicy": "0.4.0.194112.1.2"},
+           "authData": [{"id": "PIN"}, {"id": "EMAIL_OTP"}], "credentialInfo": true, "certificates": "chain"}
+        ← 201 {"credentialID": "cred-…", "cert": {…}, "SCAL": "2", …}
+```
+
+Design choices:
+
+- **The PIN is set on the provider's consent page.** The spec gives the authorization server full control of the screen (Note 18),
+  so the web app never sees the PIN.
+- **The certificate name comes from the confirmed account.** Any `subjectData` the client sends is replaced, which §11.4 allows.
+- **Supported policies:** `0.4.0.194112.1.2` (QCP-n-qscd, SCAL 2, PIN + email code) and `0.4.0.2042.1.1` (NCP, SCAL 1, PIN).
+- **Scoped tokens.** A creation token works only for `credentials/create`, only once, and only for the policy the user approved.
+  A service token from `auth/login` can't create credentials.
+- **Limits:** 5 sign-ups per IP and 3 per email address per hour, 20 failed logins per IP per 10 minutes,
+  5 credentials per user, 500 users. Unconfirmed accounts disappear after 24 h.
+
 ## How the email code fits the CSC spec
 
 `credentials/info` describes the second factor as an authentication object:
@@ -87,8 +137,8 @@ Rules the server enforces:
 ## Tests
 
 ```bash
-python -m pytest -q tests          # 12 unit tests: real SMTP to a local test inbox, cooldown, 503, single use, SCAL 2
-python tests/e2e_smoke.py          # full run: local SMTP inbox + server + web app, code read from the email
+python -m pytest -q tests          # 28 unit tests: email codes, sign-up, OAuth (PKCE, code replay, scopes), credentials/create
+python tests/e2e_smoke.py          # full run: signing as alice, then sign-up → OAuth → new credential → signing with it
 ```
 
 Neither test needs internet access or a real mailbox. They start a local SMTP server (`aiosmtpd`) and read the delivered message.
@@ -96,8 +146,9 @@ Neither test needs internet access or a real mailbox. They start a local SMTP se
 ## Files
 
 ```
-server/csc_server.py   CSC API v2.2 subset (+ getChallenge by email)
-server/mailer.py       SMTP sender (text + HTML email), console fallback
+server/csc_server.py   CSC API v2.2 subset (+ getChallenge by email), OAuth 2.0 server, sign-up
+server/pages.py        provider HTML pages: sign-up, email confirmation, login + consent
+server/mailer.py       SMTP sender (signing codes and confirmation links), console fallback
 server/pki.py          demo CA + credential keys (generated into server/data/)
 server/.env.example    configuration template
 webapp/app.py          web app backend: pyHanko interrupted signing + CSC calls + wire log
@@ -105,10 +156,29 @@ webapp/static/         index.html, app.js, style.css, sample-contract.pdf
 tests/                 pytest unit tests and the end-to-end smoke test
 ```
 
+## Deploying
+
+Both processes read their settings from environment variables (the server also reads `server/.env`).
+The defaults work on `127.0.0.1`. On a public host, put both behind an HTTPS reverse proxy and set:
+
+| Server (`server/.env`) | Web app (environment) | |
+|---|---|---|
+| `CSC_PUBLIC_URL=https://csc.example.org` | `CSC_SERVER=https://csc.example.org` | where each one is reached |
+| `CSC_OAUTH_REDIRECT_URIS=https://signer.example.org/oauth/callback` | `WEBAPP_PUBLIC_URL=https://signer.example.org` | must match exactly |
+| `CSC_OAUTH_CLIENT_SECRET=<long random>` | `OAUTH_CLIENT_SECRET=<the same>` | the default is public in this repo |
+| `CSC_HOST=0.0.0.0` | `WEBAPP_HOST=0.0.0.0` | listen address |
+| `CSC_DATA_DIR=/var/lib/csc-demo` | | keys and certificates |
+
+Both servers trust `X-Forwarded-For` / `X-Forwarded-Proto` only from `127.0.0.1` (uvicorn's default), so the per-IP limits
+work when the proxy runs on the same machine. The session cookie becomes `Secure` when `WEBAPP_PUBLIC_URL` is `https`.
+
+**Accounts and credentials live in memory.** A restart forgets every registered user and created credential.
+Their key files stay in `CSC_DATA_DIR` but are no longer loaded. Add a database before relying on the deployment.
+
 ## Notes and next steps
 
-- **Security trade-offs of this demo:** HTTP on localhost, no CSRF tokens, and sessions in memory.
-  Use HTTPS and a real session store before exposing it anywhere.
+- **Security trade-offs of this demo:** HTTP on localhost, sessions and accounts in memory, keys in files
+  instead of an HSM, and email confirmation instead of real identity proofing.
 - **The code in the subject line** ("Your signing code: 123456") is convenient but appears in phone notifications.
   Remove it from `mailer.py` if that matters to you.
 - **OAuth 2.0:** the natural next step is replacing PIN + code with an `oauth2/authorize` redirect (`scope=credential`).
