@@ -41,7 +41,8 @@ Rules enforced, following the spec:
   * errors are returned as {"error": ..., "error_description": ...}
   * unknown CSC methods return 501 Not Implemented
 
-This is a teaching demo: keys are software keys, all state is in memory.
+This is a teaching demo: keys are software keys. Accounts, credentials and refresh tokens are stored
+in SQLite (store.py, $CSC_DATA_DIR/csc.db); short-lived tokens, codes and SADs live in memory.
 Configure SMTP in server/.env (see .env.example), then:
 Run:  python server/csc_server.py   (listens on http://127.0.0.1:8080)
 """
@@ -73,6 +74,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mailer  # noqa: E402
 import pages  # noqa: E402
 import pki  # noqa: E402
+from store import Store  # noqa: E402
 from starlette.concurrency import run_in_threadpool  # noqa: E402
 
 
@@ -98,6 +100,7 @@ OID_RSA = "1.2.840.113549.1.1.1"  # rsaEncryption: hash algorithm given separate
 OID_SHA256_RSA = "1.2.840.113549.1.1.11"  # sha256WithRSAEncryption
 
 ACCESS_TOKEN_TTL = 3600
+REFRESH_TOKEN_TTL = 30 * 24 * 3600
 CREATION_TOKEN_TTL = 300
 AUTH_CODE_TTL = 60
 AUTHZ_TXN_TTL = 600
@@ -269,42 +272,51 @@ class RateLimiter:
 
 @dataclass
 class State:
-    users: dict[str, dict] = field(default_factory=dict)
-    credentials: dict[str, Credential] = field(default_factory=dict)
+    store: Store  # persistent: users, email confirmations, credentials, refresh tokens
     access_tokens: dict[str, Token] = field(default_factory=dict)
-    refresh_tokens: dict[str, str] = field(default_factory=dict)
     otps: dict[str, tuple[str, float, float]] = field(default_factory=dict)  # code, expires, sent_at
     sads: dict[str, SAD] = field(default_factory=dict)
-    verifications: dict[str, tuple[str, float, str]] = field(default_factory=dict)  # token -> user, expires, next
     authz: dict[str, AuthzTxn] = field(default_factory=dict)
     codes: dict[str, AuthCode] = field(default_factory=dict)
     limiter: RateLimiter = field(default_factory=RateLimiter)
+    keys: dict[str, tuple] = field(default_factory=dict)  # credential id -> (private key, certificate), cached
     ca_key: object = None
     ca_cert: x509.Certificate | None = None
 
 
-def build_state() -> State:
-    ca_key, ca_cert = pki.load_or_create_ca()
-    st = State()
-    st.ca_key, st.ca_cert = ca_key, ca_cert
-    st.users["alice"] = {
-        "password_hash": hash_secret(os.environ.get("DEMO_USER_PASSWORD", "alice-password")),
-        "email": os.environ.get("DEMO_USER_EMAIL", "alice@example.com"),
-        "given_name": "Alice", "family_name": "Demo", "verified": True,
-    }
+def db_path() -> Path:
+    return Path(os.environ.get("CSC_DB_PATH") or pki.DATA_DIR / "csc.db")
 
-    k1, c1 = pki.load_or_create_credential("cred-alice-qes", "Alice Demo (QES)", ca_key, ca_cert)
-    st.credentials["cred-alice-qes"] = Credential(
-        id="cred-alice-qes", owner="alice", description="Qualified signature (SCAL 2, PIN + email code)",
-        key=k1, cert=c1, pin_hash=hash_secret(os.environ.get("DEMO_PIN_QES", "123456")), scal="2",
-        expression="PIN AND EMAIL_OTP", multisign=5,
-    )
-    k2, c2 = pki.load_or_create_credential("cred-alice-adv", "Alice Demo (AdES)", ca_key, ca_cert)
-    st.credentials["cred-alice-adv"] = Credential(
-        id="cred-alice-adv", owner="alice", description="Advanced signature (SCAL 1, PIN only)",
-        key=k2, cert=c2, pin_hash=hash_secret(os.environ.get("DEMO_PIN_ADV", "1234")), scal="1",
-        expression="PIN", multisign=10,
-    )
+
+def _keep_or_hash(secret: str, stored: str | None) -> str:
+    """Reuse the stored hash if the configured secret didn't change (hashes are salted, so compare)."""
+    return stored if stored and verify_secret(secret, stored) else hash_secret(secret)
+
+
+DEMO_CREDENTIALS = [  # (id, certificate CN, description, PIN variable, default PIN, SCAL, expression, multisign)
+    ("cred-alice-qes", "Alice Demo (QES)", "Qualified signature (SCAL 2, PIN + email code)",
+     "DEMO_PIN_QES", "123456", "2", "PIN AND EMAIL_OTP", 5),
+    ("cred-alice-adv", "Alice Demo (AdES)", "Advanced signature (SCAL 1, PIN only)",
+     "DEMO_PIN_ADV", "1234", "1", "PIN", 10),
+]
+
+
+def build_state() -> State:
+    """Open (or create and migrate) the database and bring the demo account to its configured state."""
+    ca_key, ca_cert = pki.load_or_create_ca()
+    st = State(store=Store(db_path()))
+    st.ca_key, st.ca_cert = ca_key, ca_cert
+
+    alice = st.store.user("alice")
+    st.store.upsert_user("alice", os.environ.get("DEMO_USER_EMAIL", "alice@example.com"), "Alice", "Demo",
+                         _keep_or_hash(os.environ.get("DEMO_USER_PASSWORD", "alice-password"),
+                                       alice and alice["password_hash"]), verified=True)
+    for cid, cn, description, pin_var, pin_default, scal, expression, multisign in DEMO_CREDENTIALS:
+        st.keys[cid] = pki.load_or_create_credential(cid, cn, ca_key, ca_cert)
+        row = st.store.credential(cid)
+        st.store.upsert_demo_credential(cid, "alice", description,
+                                        _keep_or_hash(os.environ.get(pin_var, pin_default), row and row["pin_hash"]),
+                                        scal, expression, multisign)
     return st
 
 
@@ -362,12 +374,22 @@ def req_str(data: dict, name: str) -> str:
     return value
 
 
+def as_credential(row: dict) -> Credential:
+    """A credentials row plus its key and certificate (read from disk once, then cached)."""
+    if row["id"] not in STATE.keys:
+        STATE.keys[row["id"]] = pki.load_credential(row["id"])
+    key, cert = STATE.keys[row["id"]]
+    return Credential(id=row["id"], owner=row["owner"], description=row["description"], key=key, cert=cert,
+                      pin_hash=row["pin_hash"], scal=row["scal"], expression=row["expression"],
+                      multisign=row["multisign"], enabled=bool(row["enabled"]), failures=row["failures"])
+
+
 def credential_for(data: dict, user: str) -> Credential:
     cid = req_str(data, "credentialID")
-    cred = STATE.credentials.get(cid)
-    if cred is None or cred.owner != user:
+    row = STATE.store.credential(cid)
+    if row is None or row["owner"] != user:
         raise bad("Invalid parameter credentialID")
-    return cred
+    return as_credential(row)
 
 
 DN_NAMES = {NameOID.GIVEN_NAME: "GN", NameOID.SURNAME: "SN"}  # print these instead of bare OIDs
@@ -408,7 +430,7 @@ def auth_objects(cred: Credential) -> list[dict]:
     objs = [{"type": "Password", "id": "PIN", "format": "N", "label": "PIN",
              "description": "Please enter the signature PIN"}]
     if "EMAIL_OTP" in cred.expression:
-        to = mailer.mask(STATE.users[cred.owner]["email"])
+        to = mailer.mask(STATE.store.user(cred.owner)["email"])
         objs.append({"type": "ChallengeResponse", "id": "EMAIL_OTP", "format": "N",
                      "label": "Email code",
                      "description": f"Request a code with credentials/getChallenge, then enter the 6 digits sent to {to}"})
@@ -469,12 +491,11 @@ def check_auth_data(cred: Credential, auth_data) -> None:
         passed = all(ok(t.strip()) for t in cred.expression.split(" AND "))
 
     if not passed:
-        cred.failures += 1
-        if cred.failures >= MAX_AUTH_FAILURES:
-            cred.enabled = False
+        if STATE.store.record_auth_failure(cred.id, MAX_AUTH_FAILURES):  # stays locked across restarts
             raise bad("Credential locked")
         raise bad("The authentication data is invalid", "invalid_authentication_data")
-    cred.failures = 0
+    if cred.failures:
+        STATE.store.reset_failures(cred.id)
     STATE.otps.pop(cred.id, None)  # an OTP is single-use
 
 
@@ -495,12 +516,7 @@ def html(content: str, status: int = 200) -> HTMLResponse:
 
 def purge_expired() -> None:
     now = time.time()
-    for tok, (user, exp, _) in list(STATE.verifications.items()):
-        if exp < now:
-            STATE.verifications.pop(tok)
-            record = STATE.users.get(user)
-            if record and not record["verified"]:
-                STATE.users.pop(user)
+    STATE.store.purge_expired(now)
     for store in (STATE.authz, STATE.codes):
         for k, v in list(store.items()):
             if v.expires_at < now:
@@ -513,7 +529,7 @@ def purge_expired() -> None:
 def check_password(username: str, password: str) -> str | None:
     """Return the canonical username if the password is right, else None (unverified accounts included)."""
     username = username.strip().lower()
-    record = STATE.users.get(username)
+    record = STATE.store.user(username)
     if record is None:
         verify_secret(password, hash_secret("x"))  # same cost either way: no user enumeration by timing
         return None
@@ -558,7 +574,7 @@ async def auth_login(request: Request):
     if refresh:
         if not isinstance(refresh, str):
             raise bad("Invalid string parameter: refresh_token")
-        user = STATE.refresh_tokens.get(refresh)
+        user = STATE.store.refresh_token_user(refresh, time.time())
         if user is None:
             raise bad("Invalid refresh_token")
     else:
@@ -574,7 +590,7 @@ async def auth_login(request: Request):
         if STATE.limiter.count(account_key, 600) >= LOGIN_FAILURES_PER_ACCOUNT:
             raise CSCError(429, "invalid_request", "Too many failed logins for this account. Try again later")
         user = check_password(username, password)
-        if user is None or not STATE.users[user]["verified"]:
+        if user is None or not STATE.store.user(user)["verified"]:
             STATE.limiter.hit(account_key)
             raise bad("An error occurred during authentication process", "authentication_error")
 
@@ -583,7 +599,7 @@ async def auth_login(request: Request):
     out = {"access_token": token, "expires_in": ACCESS_TOKEN_TTL}
     if data.get("rememberMe") is True:
         rt = secrets.token_urlsafe(32)
-        STATE.refresh_tokens[rt] = user
+        STATE.store.add_refresh_token(rt, user, time.time() + REFRESH_TOKEN_TTL)
         out["refresh_token"] = rt
     return out
 
@@ -598,8 +614,7 @@ async def auth_revoke(request: Request):
         raise bad("Invalid string parameter token_type_hint")
     if token in STATE.access_tokens:
         STATE.access_tokens.pop(token)
-    elif token in STATE.refresh_tokens:
-        user = STATE.refresh_tokens.pop(token)
+    elif (user := STATE.store.revoke_refresh_token(token)) is not None:
         for t, tok in list(STATE.access_tokens.items()):
             if tok.user == user:
                 STATE.access_tokens.pop(t)
@@ -655,11 +670,10 @@ async def credentials_create(request: Request):
         raise bad("Invalid parameter “certInfo”")
     expression = creation_expression(policy, data.get("authData"))
 
-    user = STATE.users.get(tok.user)
+    user = STATE.store.user(tok.user)
     if user is None or not tok.pin_hash:
         raise CSCError(401, "invalid_token", "The access token is not valid")
-    owned = sum(1 for c in STATE.credentials.values() if c.owner == tok.user)
-    if owned >= MAX_CREDENTIALS_PER_USER:
+    if STATE.store.credential_count(tok.user) >= MAX_CREDENTIALS_PER_USER:
         raise CSCError(403, "access_denied", f"Credential limit reached ({MAX_CREDENTIALS_PER_USER} per user)")
 
     # The creation authorization is for one credential: consume it before the slow key generation.
@@ -671,7 +685,9 @@ async def credentials_create(request: Request):
     cred = Credential(id=cid, owner=tok.user, description=policy["description"], key=key, cert=cert,
                       pin_hash=tok.pin_hash, scal=policy["scal"], expression=expression,
                       multisign=policy["multisign"])
-    STATE.credentials[cid] = cred
+    STATE.keys[cid] = (key, cert)
+    STATE.store.add_credential(cid, tok.user, cred.description, policy_oid, cred.pin_hash, cred.scal,
+                               cred.expression, cred.multisign)
     print(f"  [create] {cid} for {tok.user} under policy {policy_oid}", flush=True)
     out = {"credentialID": cid,
            **credential_info(cred, certificates if want_info else "none", cert_info and want_info)}
@@ -684,7 +700,7 @@ async def credentials_list(request: Request):
     data = await body(request)
     if data.get("userID") not in (None, ""):
         raise bad("userID parameter MUST be null")
-    creds = [c for c in STATE.credentials.values() if c.owner == user]
+    creds = [as_credential(row) for row in STATE.store.credentials_of(user)]
     only_valid = data.get("onlyValid") is True
     if only_valid:
         creds = [c for c in creds if c.enabled]
@@ -725,7 +741,7 @@ async def credentials_get_challenge(request: Request):
         raise CSCError(429, "invalid_request", f"A code was just sent. Try again in {wait} s")
 
     code = f"{secrets.randbelow(10**6):06d}"
-    to = STATE.users[user]["email"]
+    to = STATE.store.user(user)["email"]
     try:
         await run_in_threadpool(mailer.send_code, to, code, cred.description, OTP_TTL // 60)
     except mailer.MailError as exc:
@@ -875,29 +891,23 @@ async def signup_submit(request: Request):
 
     purge_expired()
     username = values["email"]
-    existing = STATE.users.get(username)
+    existing = STATE.store.user(username)
     if existing and existing["verified"]:
         return again("An account with this email already exists. Sign in instead.", 409)
-    if existing is None and len(STATE.users) >= MAX_USERS:
+    if existing is None and STATE.store.user_count() >= MAX_USERS:
         return again("Sign-ups are closed on this demo server for now.", 503)
 
     # (Re)create the unconfirmed account; any older confirmation link stops working.
-    for tok, (user, _, _) in list(STATE.verifications.items()):
-        if user == username:
-            STATE.verifications.pop(tok)
-    STATE.users[username] = {"password_hash": hash_secret(password), "email": values["email"],
-                             "given_name": values["given_name"], "family_name": values["family_name"],
-                             "verified": False}
     token = secrets.token_urlsafe(32)
-    STATE.verifications[token] = (username, time.time() + VERIFY_TTL, next_url)
+    STATE.store.create_unverified_user(username, values["email"], values["given_name"], values["family_name"],
+                                       hash_secret(password), token, time.time() + VERIFY_TTL, next_url)
     link = f"{public_base(request)}/account/verify?token={token}"
     try:
         await run_in_threadpool(mailer.send_verification, values["email"], values["given_name"], link,
                                 VERIFY_TTL // 3600)
     except mailer.MailError as exc:
         print(f"  [email] delivery failed: {exc}", flush=True)
-        STATE.verifications.pop(token, None)
-        STATE.users.pop(username, None)
+        STATE.store.delete_unverified_user(username)
         return again("We couldn't send the confirmation email. Try again later.", 503)
     STATE.limiter.hit(ip_key)
     STATE.limiter.hit(mail_key)
@@ -906,12 +916,11 @@ async def signup_submit(request: Request):
 
 @app.get("/account/verify")
 async def verify_email(request: Request):
-    entry = STATE.verifications.pop(request.query_params.get("token", ""), None)
-    if entry is None or entry[1] < time.time() or entry[0] not in STATE.users:
+    entry = STATE.store.confirm_email(request.query_params.get("token", ""), time.time())
+    if entry is None:
         return html(pages.message("Link expired", "This confirmation link is invalid or has expired. "
                                   "Sign up again with the same email to get a new one."), 400)
-    username, _, next_url = entry
-    STATE.users[username]["verified"] = True
+    username, next_url = entry
     print(f"  [signup] {username} confirmed their email", flush=True)
     return html(pages.verified(username, next_url or None))
 
@@ -1041,7 +1050,7 @@ async def oauth2_authorize_submit(request: Request):
     if user is None:
         STATE.limiter.hit(ip_key)
         return html(render_authorize(request, txn, username, "Wrong email/username or password."), 400)
-    record = STATE.users[user]
+    record = STATE.store.user(user)
     if not record["verified"]:
         return html(render_authorize(request, txn, username,
                                      "Confirm your email first: open the link we sent you."), 400)
@@ -1054,7 +1063,7 @@ async def oauth2_authorize_submit(request: Request):
             return html(render_authorize(request, txn, username, "The PIN must be 4 to 8 digits."), 400)
         if pin != pin2:
             return html(render_authorize(request, txn, username, "The two PINs are different."), 400)
-        owned = sum(1 for c in STATE.credentials.values() if c.owner == user)
+        owned = STATE.store.credential_count(user)
         if owned >= MAX_CREDENTIALS_PER_USER:
             return html(render_authorize(request, txn, username,
                                          f"You already have {owned} credentials, the maximum on this demo."), 400)
@@ -1186,7 +1195,8 @@ if __name__ == "__main__":
     host = os.environ.get("CSC_HOST", "127.0.0.1")
     print(f"CSC demo RSSP on http://{host}:{port}{BASE}/  (Swagger UI: /docs)")
     print(f"Demo user: alice / {os.environ.get('DEMO_USER_PASSWORD', 'alice-password')}   "
-          f"email: {STATE.users['alice']['email']}")
+          f"email: {STATE.store.user('alice')['email']}")
+    print(f"Database: {STATE.store.path} ({STATE.store.user_count()} accounts)")
     print(f"Sign-up page: {PUBLIC_URL or f'http://{host}:{port}'}/account/signup")
     print(f"OAuth client: {', '.join(OAUTH_CLIENTS)} → {', '.join(next(iter(OAUTH_CLIENTS.values()))['redirect_uris'])}")
     if PUBLIC_URL.startswith("https://") and any(c["secret"] == "csc-signer-demo-secret"

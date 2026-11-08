@@ -20,10 +20,16 @@ internet ──443──▶ Caddy  (decodificat stack, /opt/decodificat)
 | `compose.yaml` | The production stack: environment, the `csc_data` volume, log rotation, 512 MB memory limit per container |
 | `.env.production.example` | Template for `/opt/csc-demo/.env` |
 | `deploy/Caddyfile.csc` | Site blocks to append to `/opt/decodificat/Caddyfile` |
-| `deploy/update.sh` | Delivers an update or a rollback |
+| `deploy/update.sh` | Delivers an update or a rollback, after backing up the data |
+| `server/admin.py` | Operator commands: list accounts, unlock a credential, delete an account, back up, restore |
 | `constraints.txt` | Exact versions of every Python package in the images |
 
-> **Read this first: accounts live in memory.** Each restart of `csc-server` deletes every account and every credential that users created: an update, a settings change, a crash, a reboot. Their key files stay in the volume but are no longer used. Only the files in the volume survive: the demo CA and alice's two credentials. Warn your users, or add a database before relying on the deployment.
+**What survives a restart.** Everything worth keeping is in the `csc-demo_csc_data` volume, mounted at `/data`. It survives updates, setting changes, crashes and reboots:
+
+- `csc.db`: an SQLite database with the accounts, the email confirmations, the credentials (PIN hash, locked or not) and the refresh tokens.
+- `*.pem`: the demo CA, plus the private key and certificate of every credential.
+
+Only short-lived state is lost on a restart: sign-ins, emailed codes, signing authorizations, pending OAuth requests and rate-limit counters. Users just click **Connect** again.
 
 ---
 
@@ -108,10 +114,10 @@ If the name isn't `decodificat_default`, set `PROXY_NETWORK=<name>` in `.env`.
 cd /opt/csc-demo
 docker compose up -d --build --wait     # builds both images, waits until both are healthy
 docker compose ps                       # csc-server and csc-webapp: "Up … (healthy)"
-docker compose logs csc-server          # shows "Email delivery: smtp"
+docker compose logs csc-server          # shows "Email delivery: smtp" and "Database: /data/csc.db (1 accounts)"
 ```
 
-The first start creates the demo root CA and alice's credentials in the `csc-demo_csc_data` volume.
+The first start creates the database, the demo root CA and alice's credentials in the `csc-demo_csc_data` volume.
 
 ### 5. Route the domains in Caddy
 
@@ -163,10 +169,12 @@ The script:
 
 1. Fast-forwards to `origin/main` and prints the new commits.
 2. Rebuilds both images. `--pull` also picks up security patches of `python:3.14-slim`.
-3. Recreates the containers and waits up to 120 s until both are healthy.
-4. Deletes the old images.
+3. Backs up the database and keys to `/data/backups` (see [Backups](#backups)).
+4. Recreates the containers and waits up to 120 s until both are healthy. If the new code changes the
+   database schema, the server upgrades `csc.db` when it starts.
+5. Deletes the old images.
 
-Expect a few seconds of downtime, and remember that user accounts are reset.
+Expect a few seconds of downtime. Accounts and credentials are kept; users signed in to the web app click **Connect** again.
 
 The script reports success only after both containers pass their health check. If one doesn't, it stops with an error. Look at `docker compose logs`, then fix forward or roll back.
 
@@ -177,6 +185,10 @@ git log --oneline -10                  # pick the last good commit
 ./deploy/update.sh <commit>            # deploys exactly that commit
 ./deploy/update.sh                     # later: back to the latest main
 ```
+
+**Rollback across a database change.** If the bad update upgraded the database schema, the older code refuses
+to start: `csc.db … has schema version N, newer than this code`. Restore the backup that `update.sh` took just
+before that update (see [Restore](#restore)), then roll back. Accounts created since that backup are lost.
 
 ### Changing a setting
 
@@ -194,23 +206,41 @@ docker stats --no-stream csc-demo-csc-server-1 csc-demo-csc-webapp-1
 
 Logs rotate automatically: 3 files of 10 MB per container. The server logs startup, every email it sends, and errors. It doesn't log individual requests; for those, see the Caddy logs in `/opt/decodificat`.
 
-### Backups
-
-The only data worth keeping is the `csc-demo_csc_data` volume: the demo CA's private key and alice's keys. If the CA is lost, a new one is generated, and PDFs signed earlier no longer validate in the web app.
+### Managing accounts
 
 ```bash
-# back up (writes csc-data-YYYY-MM-DD.tgz in the current directory; it contains private keys, so keep it private)
-docker run --rm -v csc-demo_csc_data:/data:ro -v "$PWD":/backup alpine \
-  tar czf /backup/csc-data-$(date +%F).tgz -C /data .
-
-# restore
-docker compose stop csc-server
-docker run --rm -v csc-demo_csc_data:/data -v "$PWD":/backup alpine \
-  sh -c 'rm -rf /data/* && tar xzf /backup/csc-data-YYYY-MM-DD.tgz -C /data && chown -R 10001 /data'
-docker compose up -d --wait
+docker compose exec csc-server python server/admin.py users                       # accounts, credentials, locked ones
+docker compose exec csc-server python server/admin.py unlock cred-0123abcd…       # after 3 wrong PINs/codes
+docker compose exec csc-server python server/admin.py delete-user bob@example.com # account, credentials, key files
 ```
 
-Accounts aren't backed up because they only exist in memory.
+- **Locked credentials** stay locked across restarts. Only `unlock` re-enables them. alice's two credentials are the exception: they're reset to the PINs in `.env` and unlocked on every start.
+- **Changing alice's password or PINs** in `.env` takes effect at the next start.
+
+### Backups
+
+The volume holds everything: `csc.db` plus the private keys of the CA and of every credential. If it's lost, every account is gone, and PDFs signed earlier no longer validate in the web app because a new CA is generated.
+
+```bash
+docker compose exec csc-server python server/admin.py backup     # → /data/backups/csc-data-YYYYMMDD-HHMMSS.tgz
+docker compose exec csc-server ls -l /data/backups
+docker compose cp csc-server:/data/backups/csc-data-YYYYMMDD-HHMMSS.tgz ~/   # copy it off the container
+```
+
+- **Safe while the server runs:** the database is copied with SQLite's online backup.
+- **Retention:** `/data/backups` keeps the newest 10 archives. `update.sh` adds one before every deploy.
+- **Off-site copies:** backups inside the volume don't protect against losing the volume. Copy one to your laptop now and then, for example `scp deploy@srv722182:~/csc-data-….tgz .`. The archive contains private keys, so keep it private.
+
+#### Restore
+
+This replaces all current data with the backup.
+
+```bash
+docker compose stop csc-server
+# If the archive isn't in the volume yet:  docker compose cp ~/csc-data-….tgz csc-server:/data/backups/
+docker compose run --rm --no-deps csc-server python server/admin.py restore /data/backups/csc-data-YYYYMMDD-HHMMSS.tgz
+docker compose up -d --wait
+```
 
 ### Updating Python dependencies
 
@@ -232,16 +262,13 @@ Do this every few months, or when a security advisory affects `cryptography`, `p
 ### Housekeeping
 
 - **Build cache:** `docker builder prune -f` now and then frees build cache. `update.sh` already deletes old images.
-- **Orphaned key files:** credentials that users created become orphans after a restart, about 3 KB each. Right after a restart you can delete them with:
-  ```bash
-  docker compose exec csc-server sh -c "find /data -name 'cred-*' ! -name 'cred-alice-*' -delete"
-  ```
+- **Unconfirmed sign-ups** are deleted automatically 24 hours after the last confirmation link was sent.
 - **Stopping the decodificat stack:** `docker compose down` in `/opt/decodificat` warns that `decodificat_default` still has active endpoints, and leaves the network in place. That's expected. After the decodificat stack comes back up, CSC works again with no action needed.
 
 ### Removing the deployment
 
 1. Delete the two site blocks from `/opt/decodificat/Caddyfile` and reload Caddy (step 5).
-2. In `/opt/csc-demo`, run `docker compose down -v --rmi all`. This also deletes the volume with the keys.
+2. In `/opt/csc-demo`, run `docker compose down -v --rmi all`. This also deletes the volume with the database and the keys; take a backup first if you may want them back.
 3. Remove the `csc` and `cscweb` DNS records.
 
 ---
@@ -256,5 +283,6 @@ Do this every few months, or when a security advisory affects `cryptography`, `p
 | Web app: *Cannot reach the CSC server at https://csc.decodificat.ro* | The container can't reach the VPS's own public IP (no hairpin NAT). Test with `docker compose exec csc-webapp python -c "import urllib.request as u; print(u.urlopen('https://csc.decodificat.ro/docs').status)"`. Fix: in `compose.yaml`, under `csc-webapp`, add `extra_hosts: ["csc.decodificat.ro:host-gateway"]`, then run `docker compose up -d`. |
 | Sign-up says it can't send the email (HTTP 503) | Check SMTP: `docker compose logs csc-server` shows the SMTP error. For Gmail, use an App Password. If the provider blocks port 587, try `SMTP_PORT=465` with `SMTP_SECURITY=ssl`. |
 | Provider page: *The redirect_uri is not registered* | `WEBAPP_DOMAIN` doesn't match the address the web app is actually reached at. |
-| A user's credentials disappeared | The server restarted; accounts live in memory. See the warning at the top. |
+| `csc-server` keeps restarting with *schema version N, newer than this code* | Code older than the database was deployed. Deploy newer code, or restore a backup from before the upgrade ([rollback](#rolling-back)). |
+| A user's credential says *disabled* / *Credential locked* | 3 wrong PINs or codes in a row. Run `python server/admin.py unlock <id>` (see [Managing accounts](#managing-accounts)). |
 | `auth/login` returns 429 for one account | 10 wrong passwords for that account in 10 minutes. It unlocks automatically after 10 minutes, or immediately when the server restarts. |

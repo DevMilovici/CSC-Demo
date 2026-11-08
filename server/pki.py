@@ -8,7 +8,7 @@ simulated in software so the demo runs anywhere:
 * one RSA-2048 key + end-entity certificate per credential
 
 Everything is persisted under server/data/ (or $CSC_DATA_DIR) so the client can trust the same
-root CA across restarts. NEVER use this for real signatures.
+root CA across restarts. The database (store.py) lives there too. NEVER use this for real signatures.
 """
 
 from __future__ import annotations
@@ -137,6 +137,12 @@ def _issue(
 def _save(credential_id: str, key: rsa.RSAPrivateKey, cert: x509.Certificate) -> None:
     _write_key(DATA_DIR / f"{credential_id}.key.pem", key)
     (DATA_DIR / f"{credential_id}.pem").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+
+
+def load_credential(credential_id: str) -> tuple[rsa.RSAPrivateKey, x509.Certificate]:
+    """Read the key and certificate of a stored credential (raises FileNotFoundError if missing)."""
+    key = _read_key(DATA_DIR / f"{credential_id}.key.pem")
+    return key, x509.load_pem_x509_certificate((DATA_DIR / f"{credential_id}.pem").read_bytes())
 
 
 def load_or_create_credential(

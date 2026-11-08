@@ -53,14 +53,16 @@ def inbox(monkeypatch):
 
 
 @pytest.fixture()
-def api(monkeypatch):
+def api(monkeypatch, tmp_path):
     monkeypatch.setenv("DEMO_USER_EMAIL", "alice@example.com")
+    monkeypatch.setenv("CSC_DB_PATH", str(tmp_path / "csc.db"))  # a fresh database per test
     csc_server.STATE = csc_server.build_state()
     c = TestClient(csc_server.app)
     basic = base64.b64encode(b"alice:alice-password").decode()
     tok = c.post(f"{B}/auth/login", json={}, headers={"Authorization": f"Basic {basic}"}).json()["access_token"]
     c.headers["Authorization"] = f"Bearer {tok}"
-    return c
+    yield c
+    csc_server.STATE.store.close()
 
 
 def challenge(api, cid="cred-alice-qes"):

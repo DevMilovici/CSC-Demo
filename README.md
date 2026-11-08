@@ -11,7 +11,7 @@ Remote-signing demo for the Cloud Signature Consortium API:
 Users can also **sign up** at the provider (with email confirmation) and **request their own signing
 credential** through the spec's OAuth 2.0 `credential-creation` flow and `credentials/create`.
 
-> Demo only: software keys instead of an HSM, a self-signed CA, and in-memory state. Don't use it for real signatures.
+> Demo only: software keys instead of an HSM, a self-signed CA, and no real identity proofing. Don't use it for real signatures.
 
 ## 1. Install
 
@@ -141,7 +141,7 @@ Rules the server enforces:
 ## Tests
 
 ```bash
-python -m pytest -q tests          # 29 unit tests: email codes, sign-up, OAuth (PKCE, code replay, scopes), credentials/create
+python -m pytest -q tests          # 38 unit tests: email codes, sign-up, OAuth (PKCE, code replay, scopes), credentials/create, persistence
 python tests/e2e_smoke.py          # full run: signing as alice, then sign-up → OAuth → new credential → signing with it
 ```
 
@@ -154,6 +154,8 @@ server/csc_server.py   CSC API v2.2 subset (+ getChallenge by email), OAuth 2.0 
 server/pages.py        provider HTML pages: sign-up, email confirmation, login + consent
 server/mailer.py       SMTP sender (signing codes and confirmation links), console fallback
 server/pki.py          demo CA + credential keys (generated into server/data/)
+server/store.py        SQLite storage: accounts, email confirmations, credentials, refresh tokens (server/data/csc.db)
+server/admin.py        operator commands: list accounts, unlock a credential, delete an account, backup, restore
 server/.env.example    configuration template
 webapp/app.py          web app backend: pyHanko interrupted signing + CSC calls + wire log
 webapp/static/         index.html, app.js, style.css, sample-contract.pdf
@@ -178,7 +180,7 @@ The defaults work on `127.0.0.1`. On a public host, put both behind an HTTPS rev
 | `CSC_OAUTH_REDIRECT_URIS=https://signer.example.org/oauth/callback` | `WEBAPP_PUBLIC_URL=https://signer.example.org` | must match exactly |
 | `CSC_OAUTH_CLIENT_SECRET=<long random>` | `OAUTH_CLIENT_SECRET=<the same>` | the default is public in this repo |
 | `CSC_HOST=0.0.0.0` | `WEBAPP_HOST=0.0.0.0` | listen address |
-| `CSC_DATA_DIR=/var/lib/csc-demo` | | keys and certificates |
+| `CSC_DATA_DIR=/var/lib/csc-demo` | | keys, certificates and the database (`csc.db`) |
 | `DEMO_USER_PASSWORD=<your own>` | `WEBAPP_DEMO_LOGIN=` (empty) | the defaults are public; empty = no prefilled login |
 | | `CSC_SERVER_LOCKED=1` | only talk to `CSC_SERVER`, ignore the URL typed in step 1 |
 
@@ -189,12 +191,12 @@ Both servers trust `X-Forwarded-For` / `X-Forwarded-Proto` only from `127.0.0.1`
 `FORWARDED_ALLOW_IPS`), so the per-IP limits work when the proxy runs on the same machine. The session cookie becomes
 `Secure` when `WEBAPP_PUBLIC_URL` is `https`.
 
-**Accounts and credentials live in memory.** A restart forgets every registered user and created credential.
-Their key files stay in `CSC_DATA_DIR` but are no longer loaded. Add a database before relying on the deployment.
+**Data.** Accounts, credentials and refresh tokens are stored in SQLite at `CSC_DATA_DIR/csc.db`
+(or `CSC_DB_PATH`), next to the key files. Back up that folder with `python server/admin.py backup`.
 
 ## Notes and next steps
 
-- **Security trade-offs of this demo:** HTTP on localhost, sessions and accounts in memory, keys in files
+- **Security trade-offs of this demo:** HTTP on localhost, web app sessions in memory, keys in unencrypted files
   instead of an HSM, and email confirmation instead of real identity proofing.
 - **The code in the subject line** ("Your signing code: 123456") is convenient but appears in phone notifications.
   Remove it from `mailer.py` if that matters to you.

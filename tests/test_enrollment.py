@@ -65,7 +65,8 @@ def inbox(monkeypatch):
 def c(inbox, monkeypatch, tmp_path):
     monkeypatch.setattr(pki, "DATA_DIR", tmp_path)  # keys of created credentials go to a temp dir
     csc_server.STATE = csc_server.build_state()
-    return TestClient(csc_server.app)
+    yield TestClient(csc_server.app)
+    csc_server.STATE.store.close()
 
 
 # --------------------------------------------------------------------------- helpers
