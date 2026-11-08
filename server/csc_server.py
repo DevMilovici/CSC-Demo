@@ -113,7 +113,10 @@ MAX_USERS = int(os.environ.get("CSC_MAX_USERS", "500"))
 MAX_CREDENTIALS_PER_USER = int(os.environ.get("CSC_MAX_CREDENTIALS_PER_USER", "5"))
 SIGNUPS_PER_IP_PER_HOUR = int(os.environ.get("CSC_SIGNUPS_PER_IP_PER_HOUR", "5"))
 SIGNUPS_PER_EMAIL_PER_HOUR = 3
-LOGIN_FAILURES_PER_IP = 20  # per 10 minutes
+LOGIN_FAILURES_PER_IP = 20  # per 10 minutes, on the provider's own login page (the browser talks to us)
+# auth/login is called by the signature app's backend, so every user of one app shares its IP.
+# Counting per IP there would let one visitor lock everybody out; count per account instead.
+LOGIN_FAILURES_PER_ACCOUNT = 10  # per 10 minutes
 MAX_PENDING_AUTHZ = 5000
 PBKDF2_ITERATIONS = 120_000
 
@@ -567,12 +570,12 @@ async def auth_login(request: Request):
             username, password = decoded.split(":", 1)
         except (ValueError, binascii.Error, UnicodeDecodeError):
             raise bad("Malformed username-password.")
-        ip_key = f"login:{client_ip(request)}"
-        if STATE.limiter.count(ip_key, 600) >= LOGIN_FAILURES_PER_IP:
-            raise CSCError(429, "invalid_request", "Too many failed logins. Try again later")
+        account_key = f"login-account:{username.strip().lower()}"
+        if STATE.limiter.count(account_key, 600) >= LOGIN_FAILURES_PER_ACCOUNT:
+            raise CSCError(429, "invalid_request", "Too many failed logins for this account. Try again later")
         user = check_password(username, password)
         if user is None or not STATE.users[user]["verified"]:
-            STATE.limiter.hit(ip_key)
+            STATE.limiter.hit(account_key)
             raise bad("An error occurred during authentication process", "authentication_error")
 
     token = secrets.token_urlsafe(32)

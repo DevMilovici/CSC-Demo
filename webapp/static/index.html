@@ -23,11 +23,11 @@
       <header><span class="num">1</span><div><h2>Connect to a signing provider</h2><p class="hint">Calls <code>info</code>, <code>auth/login</code>, <code>credentials/list</code> and <code>credentials/info</code></p></div></header>
       <div class="body">
         <form id="connectForm" class="grid">
-          <label class="wide">CSC server<input id="server" value="http://127.0.0.1:8080" autocomplete="url" required></label>
-          <label>Username<input id="username" value="alice" autocomplete="username" required></label>
-          <label>Password<input id="password" type="password" value="alice-password" autocomplete="current-password" required></label>
+          <label class="wide">CSC server<input id="server" value="{{CSC_SERVER}}" autocomplete="url" required{{SERVER_LOCK}}></label>
+          <label>Username<input id="username" value="{{DEMO_USERNAME}}" autocomplete="username" required></label>
+          <label>Password<input id="password" type="password" value="{{DEMO_PASSWORD}}" autocomplete="current-password" required></label>
           <div class="actions wide"><button class="primary" type="submit">Connect</button><span class="error" id="e1"></span></div>
-          <p class="hint wide">No account at this provider? <a id="signupLink" href="http://127.0.0.1:8080/account/signup" target="_blank" rel="noopener">Create one</a>, confirm your email, then connect here.</p>
+          <p class="hint wide">No account at this provider? <a id="signupLink" href="{{CSC_SERVER}}/account/signup" target="_blank" rel="noopener">Create one</a>, confirm your email, then connect here.</p>
         </form>
         <div class="summary" id="sum1"></div>
       </div>

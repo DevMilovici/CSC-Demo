@@ -1,0 +1,8 @@
+# Allow-list: only what the images need goes into the build context.
+# server/.env (SMTP password) and server/data/ (private keys) can never end up in an image.
+**
+!requirements.txt
+!constraints.txt
+!server/*.py
+!webapp/app.py
+!webapp/static/**

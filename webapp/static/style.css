@@ -46,6 +46,7 @@ h2 { font: 600 18px/1.25 var(--head); margin: 0; }
 label { display: flex; flex-direction: column; gap: 5px; font-size: 13px; font-weight: 500; color: var(--muted); }
 input:not([type=radio]):not([type=checkbox]) { font: 15px var(--sans); padding: 9px 11px; border: 1px solid #CFCAC0; border-radius: 8px; background: #FCFBF8; color: var(--text); }
 input:not([type=radio]):not([type=checkbox]):focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: transparent; }
+input[readonly] { background: #EEEBE4; color: var(--muted); }
 #code { font-family: var(--mono); letter-spacing: 6px; font-size: 18px; }
 .actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 4px; }
 button, .button { font: 500 14px var(--sans); padding: 9px 16px; border-radius: 8px; border: 1px solid #CFCAC0; background: #fff; color: var(--text); cursor: pointer; text-decoration: none; display: inline-block; }

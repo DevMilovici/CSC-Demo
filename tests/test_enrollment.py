@@ -355,3 +355,17 @@ def test_oauth_revoke(c, inbox):
     r = c.post("/oauth2/revoke", data={"token": tok, "client_id": CLIENT_ID, "client_secret": SECRET})
     assert r.status_code == 204
     assert create(c, tok).status_code == 401
+
+
+def test_login_failures_lock_the_account_not_the_shared_client_ip(c):
+    """Every auth/login comes from the signature app's one IP: a visitor guessing passwords
+    must lock only the account being guessed, not every user of that app."""
+    for _ in range(csc_server.LOGIN_FAILURES_PER_ACCOUNT):
+        assert c.post(f"{B}/auth/login", json={}, headers=basic("alice", "wrong")).status_code == 400
+    locked = c.post(f"{B}/auth/login", json={}, headers=basic("alice", "alice-password"))
+    assert locked.status_code == 429
+    assert c.post(f"{B}/auth/login", json={}, headers=basic("ALICE ", "x")).status_code == 429  # same account
+    for _ in range(csc_server.LOGIN_FAILURES_PER_IP):  # other accounts from the same IP still work
+        c.post(f"{B}/auth/login", json={}, headers=basic("nobody@example.com", "wrong"))
+    c.post(f"{B}/auth/login", json={}, headers=basic("carol@example.com", "wrong"))
+    assert c.post(f"{B}/auth/login", json={}, headers=basic("ALICE ", "x")).status_code == 429

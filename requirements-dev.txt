@@ -1,0 +1,4 @@
+# Everything needed to run the demo locally and its tests
+-r requirements.txt
+pytest>=8.0
+aiosmtpd>=1.4

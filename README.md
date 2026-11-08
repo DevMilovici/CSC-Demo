@@ -16,7 +16,7 @@ credential** through the spec's OAuth 2.0 `credential-creation` flow and `creden
 ## 1. Install
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-dev.txt     # runtime dependencies + pytest/aiosmtpd for the tests
 ```
 
 ## 2. Configure email
@@ -99,8 +99,12 @@ Design choices:
 - **Supported policies:** `0.4.0.194112.1.2` (QCP-n-qscd, SCAL 2, PIN + email code) and `0.4.0.2042.1.1` (NCP, SCAL 1, PIN).
 - **Scoped tokens.** A creation token works only for `credentials/create`, only once, and only for the policy the user approved.
   A service token from `auth/login` can't create credentials.
-- **Limits:** 5 sign-ups per IP and 3 per email address per hour, 20 failed logins per IP per 10 minutes,
-  5 credentials per user, 500 users. Unconfirmed accounts disappear after 24 h.
+- **Limits:**
+  - Sign-ups: 5 per IP and 3 per email address per hour.
+  - Failed logins on the provider's page: 20 per IP per 10 minutes.
+  - Failed `auth/login` calls: 10 per account per 10 minutes. These are counted per account because they all come
+    from the signature app's single IP.
+  - 5 credentials per user, 500 users. Unconfirmed accounts disappear after 24 h.
 
 ## How the email code fits the CSC spec
 
@@ -137,7 +141,7 @@ Rules the server enforces:
 ## Tests
 
 ```bash
-python -m pytest -q tests          # 28 unit tests: email codes, sign-up, OAuth (PKCE, code replay, scopes), credentials/create
+python -m pytest -q tests          # 29 unit tests: email codes, sign-up, OAuth (PKCE, code replay, scopes), credentials/create
 python tests/e2e_smoke.py          # full run: signing as alice, then sign-up → OAuth → new credential → signing with it
 ```
 
@@ -154,11 +158,18 @@ server/.env.example    configuration template
 webapp/app.py          web app backend: pyHanko interrupted signing + CSC calls + wire log
 webapp/static/         index.html, app.js, style.css, sample-contract.pdf
 tests/                 pytest unit tests and the end-to-end smoke test
+Dockerfile             images for the server (--target server) and the web app (--target webapp)
+compose.yaml           production stack behind the decodificat Caddy (see DEPLOY.md)
+deploy/                Caddy site blocks and the update script
+requirements.txt       runtime dependencies; constraints.txt pins their exact versions for the images
 ```
 
 ## Deploying
 
-Both processes read their settings from environment variables (the server also reads `server/.env`).
+**With Docker:** [DEPLOY.md](DEPLOY.md) covers the production setup at csc.decodificat.ro and cscweb.decodificat.ro,
+with updates, rollbacks and backups.
+
+Without Docker, both processes read their settings from environment variables (the server also reads `server/.env`).
 The defaults work on `127.0.0.1`. On a public host, put both behind an HTTPS reverse proxy and set:
 
 | Server (`server/.env`) | Web app (environment) | |
@@ -168,9 +179,15 @@ The defaults work on `127.0.0.1`. On a public host, put both behind an HTTPS rev
 | `CSC_OAUTH_CLIENT_SECRET=<long random>` | `OAUTH_CLIENT_SECRET=<the same>` | the default is public in this repo |
 | `CSC_HOST=0.0.0.0` | `WEBAPP_HOST=0.0.0.0` | listen address |
 | `CSC_DATA_DIR=/var/lib/csc-demo` | | keys and certificates |
+| `DEMO_USER_PASSWORD=<your own>` | `WEBAPP_DEMO_LOGIN=` (empty) | the defaults are public; empty = no prefilled login |
+| | `CSC_SERVER_LOCKED=1` | only talk to `CSC_SERVER`, ignore the URL typed in step 1 |
 
-Both servers trust `X-Forwarded-For` / `X-Forwarded-Proto` only from `127.0.0.1` (uvicorn's default), so the per-IP limits
-work when the proxy runs on the same machine. The session cookie becomes `Secure` when `WEBAPP_PUBLIC_URL` is `https`.
+**Lock the web app to one server on a public host.** Without `CSC_SERVER_LOCKED`, its backend sends a request to any
+URL a visitor types and shows the response. That lets visitors reach internal services on your network.
+
+Both servers trust `X-Forwarded-For` / `X-Forwarded-Proto` only from `127.0.0.1` (uvicorn's default; change it with
+`FORWARDED_ALLOW_IPS`), so the per-IP limits work when the proxy runs on the same machine. The session cookie becomes
+`Secure` when `WEBAPP_PUBLIC_URL` is `https`.
 
 **Accounts and credentials live in memory.** A restart forgets every registered user and created credential.
 Their key files stay in `CSC_DATA_DIR` but are no longer loaded. Add a database before relying on the deployment.

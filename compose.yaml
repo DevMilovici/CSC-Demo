@@ -1,0 +1,71 @@
+# Production stack for csc.decodificat.ro (CSC server) and cscweb.decodificat.ro (web app).
+#
+# Both containers join the existing decodificat network, where the decodificat Caddy reaches them
+# by service name (csc-server:8080, csc-webapp:8000) and terminates HTTPS. No ports are published
+# on the host. Settings come from .env next to this file (template: .env.production.example).
+#
+#   docker compose up -d --build --wait     # first start and every update (or ./deploy/update.sh)
+#
+# Full guide: DEPLOY.md
+
+name: csc-demo
+
+x-defaults: &defaults
+  restart: unless-stopped
+  networks: [proxy]
+  mem_limit: 512m
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+  csc-server:
+    <<: *defaults
+    build: { context: ., target: server }
+    image: csc-demo-server:latest
+    environment:
+      CSC_PUBLIC_URL: https://${CSC_DOMAIN:?set CSC_DOMAIN in .env}
+      CSC_OAUTH_CLIENT_ID: csc-signer
+      CSC_OAUTH_CLIENT_SECRET: ${OAUTH_CLIENT_SECRET:?set OAUTH_CLIENT_SECRET in .env}
+      CSC_OAUTH_REDIRECT_URIS: https://${WEBAPP_DOMAIN:?set WEBAPP_DOMAIN in .env}/oauth/callback
+      # Only Caddy can reach this container (no published ports), so its X-Forwarded-For is trusted.
+      # The per-IP limits on sign-up and on the provider's login page depend on it.
+      FORWARDED_ALLOW_IPS: "*"
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURITY: ${SMTP_SECURITY:-starttls}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      DEMO_USER_EMAIL: ${DEMO_USER_EMAIL:?set DEMO_USER_EMAIL in .env}
+      DEMO_USER_PASSWORD: ${DEMO_USER_PASSWORD:?set DEMO_USER_PASSWORD in .env}
+      DEMO_PIN_QES: ${DEMO_PIN_QES:-123456}
+      DEMO_PIN_ADV: ${DEMO_PIN_ADV:-1234}
+      CSC_MAX_USERS: ${CSC_MAX_USERS:-500}
+      CSC_MAX_CREDENTIALS_PER_USER: ${CSC_MAX_CREDENTIALS_PER_USER:-5}
+      CSC_SIGNUPS_PER_IP_PER_HOUR: ${CSC_SIGNUPS_PER_IP_PER_HOUR:-5}
+    volumes:
+      - csc_data:/data
+
+  csc-webapp:
+    <<: *defaults
+    build: { context: ., target: webapp }
+    image: csc-demo-webapp:latest
+    environment:
+      CSC_SERVER: https://${CSC_DOMAIN}
+      CSC_SERVER_LOCKED: "1"
+      WEBAPP_PUBLIC_URL: https://${WEBAPP_DOMAIN}
+      OAUTH_CLIENT_ID: csc-signer
+      OAUTH_CLIENT_SECRET: ${OAUTH_CLIENT_SECRET}
+      WEBAPP_DEMO_LOGIN: ${WEBAPP_DEMO_LOGIN:-}
+      FORWARDED_ALLOW_IPS: "*"
+    depends_on:
+      csc-server: { condition: service_healthy }
+
+networks:
+  proxy:
+    external: true
+    name: ${PROXY_NETWORK:-decodificat_default}
+
+volumes:
+  csc_data:

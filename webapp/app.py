@@ -35,6 +35,7 @@ import secrets
 import json
 import time
 from dataclasses import dataclass, field
+from html import escape
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -53,7 +54,12 @@ from pyhanko_certvalidator import ValidationContext
 from pyhanko_certvalidator.registry import SimpleCertificateStore
 
 STATIC = Path(__file__).resolve().parent / "static"
-DEFAULT_CSC = os.environ.get("CSC_SERVER", "http://127.0.0.1:8080")
+DEFAULT_CSC = os.environ.get("CSC_SERVER", "http://127.0.0.1:8080").rstrip("/")
+# On a public host, lock the app to DEFAULT_CSC. Otherwise this backend POSTs to any URL a visitor
+# types in and shows the response: a server-side request forgery into the host's internal network.
+SERVER_LOCKED = os.environ.get("CSC_SERVER_LOCKED", "0").lower() in ("1", "true", "yes")
+# "user:password" prefilled in step 1 for the built-in demo account; set it empty to prefill nothing.
+DEMO_USERNAME, _, DEMO_PASSWORD = os.environ.get("WEBAPP_DEMO_LOGIN", "alice:alice-password").partition(":")
 OID_SHA256 = "2.16.840.1.101.3.4.2.1"
 OID_SHA256_RSA = "1.2.840.113549.1.1.11"
 MAX_PDF_BYTES = 10 * 1024 * 1024
@@ -217,7 +223,8 @@ def require(s: Session, what: str):
 async def api_connect(request: Request):
     sid, s = session_of(request)
     body = await request.json()
-    SESSIONS[sid] = s = Session(server=(body.get("server") or DEFAULT_CSC).strip())
+    server = DEFAULT_CSC if SERVER_LOCKED else (body.get("server") or DEFAULT_CSC).strip()
+    SESSIONS[sid] = s = Session(server=server)
     log: list = []
     s.info = await csc(s, log, "info", step="Discover the service")
     login = await csc(s, log, "auth/login", {"rememberMe": False},
@@ -477,6 +484,10 @@ async def index():
     page = (STATIC / "index.html").read_text(encoding="utf-8")
     for name in ("style.css", "app.js"):
         page = page.replace(f'"/static/{name}"', f'"{asset_url(name)}"')
+    for marker, value in {"{{CSC_SERVER}}": escape(DEFAULT_CSC), "{{DEMO_USERNAME}}": escape(DEMO_USERNAME),
+                          "{{DEMO_PASSWORD}}": escape(DEMO_PASSWORD),
+                          "{{SERVER_LOCK}}": " readonly" if SERVER_LOCKED else ""}.items():
+        page = page.replace(marker, value)
     return Response(page, media_type="text/html; charset=utf-8", headers=NO_CACHE)
 
 
@@ -495,6 +506,7 @@ if __name__ == "__main__":
     import uvicorn
 
     host = os.environ.get("WEBAPP_HOST", "127.0.0.1")
-    print(f"CSC Signer web app on http://{host}:{PORT}  (CSC server: {DEFAULT_CSC})")
+    print(f"CSC Signer web app on http://{host}:{PORT}  (CSC server: {DEFAULT_CSC}"
+          f"{', locked' if SERVER_LOCKED else ''})")
     print(f"OAuth client {OAUTH_CLIENT_ID}, redirect_uri {REDIRECT_URI}")
     uvicorn.run(app, host=host, port=PORT, log_level="warning", proxy_headers=True)
